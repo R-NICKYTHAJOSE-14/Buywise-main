@@ -57,3 +57,6 @@ tool-results/
 /skills/
 # Local database
 /db/
+AGENTS.md
+prisma.zip
+scripts/test-chat.ts
