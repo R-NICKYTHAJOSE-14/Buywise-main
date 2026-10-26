@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from 'react'
 import { useStore } from '@/lib/store'
-import { api } from '@/lib/api'
+import { api, clearSessionToken } from '@/lib/api'
+import { toast } from 'sonner'
 import { Header } from '@/components/shared/header'
 import { Footer } from '@/components/shared/footer'
 import { AuthModal } from '@/components/shared/auth-modal'
@@ -29,7 +30,28 @@ export default function Page() {
 
   useEffect(() => {
     api.categories().then((r) => { setCategories(r.categories); setBrands(r.brands) }).catch(() => {})
-    api.auth.me().then((r) => setUser(r.user)).catch(() => {}).finally(() => setReady(true))
+    // Returning from Google OAuth: drop any stale local token so the fresh session cookie is used, and surface errors.
+    const params = new URLSearchParams(window.location.search)
+    const authResult = params.get('auth')
+    const authError = params.get('auth_error')
+    if (authResult === 'google') clearSessionToken()
+    api.auth.me().then((r) => {
+      setUser(r.user)
+      if (authResult === 'google') {
+        if (r.user) toast.success(`Welcome to Buywise, ${r.user.firstName}! Signed in with Google.`)
+        else toast.error('Google sign-in could not be completed. Please try again.')
+      }
+    }).catch(() => {}).finally(() => setReady(true))
+    if (authError) {
+      const messages: Record<string, string> = {
+        google_cancelled: 'Google sign-in was cancelled.',
+        google_not_configured: 'Google sign-in is not configured on this site.',
+        google_unverified: 'Your Google email is not verified, so we could not sign you in.',
+        google_state: 'Google sign-in expired or was tampered with. Please try again.',
+      }
+      toast.error(messages[authError] || 'Google sign-in failed. Please try again.')
+    }
+    if (authResult || authError) window.history.replaceState({}, '', window.location.pathname)
   }, [setUser])
 
   // Handle ?room=<slug> shareable link — auto-navigate to the room

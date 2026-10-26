@@ -52,12 +52,22 @@ export const api = {
       if ((res as any).token) setSessionToken((res as any).token)
       return { user: res.user }
     },
-    google: async (data: { credential?: string; email?: string; firstName?: string; lastName?: string }) => {
-      const res = await request<{ user: any; token?: string }>('/api/auth/google', {
+    // Real Google OAuth: full-page redirect to Google; the server verifies the identity on return.
+    google: () => {
+      clearSessionToken() // never let a stale token shadow the new session
+      window.location.href = '/api/auth/google'
+    },
+    otpRequest: (email: string) =>
+      request<{ ok: boolean; expiresInSec: number; resendAfterSec: number }>('/api/auth/otp/request', {
         method: 'POST',
-        body: JSON.stringify(data),
+        body: JSON.stringify({ email }),
+      }),
+    otpVerify: async (email: string, code: string) => {
+      const res = await request<{ user: any; token?: string }>('/api/auth/otp/verify', {
+        method: 'POST',
+        body: JSON.stringify({ email, code }),
       })
-      if ((res as any).token) setSessionToken((res as any).token)
+      if (res.token) setSessionToken(res.token)
       return { user: res.user }
     },
     logout: async () => {

@@ -35,6 +35,21 @@ model User {
   shoppingRooms ShoppingRoomMember[]
 }
 
+// One-time email login codes. Only an HMAC of the code is stored, never the code itself.
+model OtpCode {
+  id         String    @id @default(cuid())
+  email      String
+  codeHash   String
+  ip         String?
+  attempts   Int       @default(0)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([email, createdAt])
+  @@index([ip, createdAt])
+}
+
 model UserPreferences {
   id              String   @id @default(cuid())
   userId          String   @unique

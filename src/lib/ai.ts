@@ -199,39 +199,229 @@ function serializeProduct(p: Product & { brand?: { name: string } | null, catego
   }
 }
 
+// ----------------------------------------------------------------------------
+// Product catalog search & ranking
+// ----------------------------------------------------------------------------
+const STOP_WORDS = new Set([
+  'and','or','the','a','an','for','with','in','on','at','to','of','by','from','is','are','was','were',
+  'be','been','being','have','has','had','do','does','did','will','would','shall','should','may','might',
+  'must','can','could','i','you','he','she','it','we','they','my','your','his','her','its','our','their',
+  'me','him','us','them','this','that','these','those','what','which','who','whom','whose','where','when',
+  'why','how','all','any','both','each','few','more','most','other','some','such','no','nor','not','only',
+  'own','same','so','than','too','very','just','now','please','options','items','products','find','show',
+  'give','recommend','suggest','need','want','looking','good'
+])
+
+const ACCESSORY_WORDS = new Set(['bag', 'sleeve', 'case', 'cover', 'stand', 'charger', 'cable', 'backpack', 'holder', 'strap', 'skin', 'pouch'])
+const STATIONERY_WORDS = new Set(['notebook', 'diary', 'stationery', 'pen', 'pencil', 'pad', 'paper', 'journal'])
+
+const PRODUCT_TYPE_MAPPINGS = [
+  { type: 'laptop', re: /\b(laptop|ultrabook|macbook|chromebook)\b/i, categorySlugs: ['laptops-tablets', 'laptops'] },
+  { type: 'tablet', re: /\b(tablet|ipad)\b/i, categorySlugs: ['laptops-tablets'] },
+  { type: 'headphone', re: /\b(headphone|headphones|earphone|earphones|earbud|earbuds|airpods|headset)\b/i, categorySlugs: ['headphones-earbuds', 'headphones'] },
+  { type: 'phone', re: /\b(phone|smartphone|smartphones|mobile|iphone)\b/i, categorySlugs: ['mobile-phones', 'smartphones'] },
+  { type: 'watch', re: /\b(smartwatch|smartwatches|watch|watches)\b/i, categorySlugs: ['smartwatches-wearables', 'watches'] },
+  { type: 'tv', re: /\b(tv|television|televisions)\b/i, categorySlugs: ['televisions'] },
+  { type: 'backpack', re: /\b(backpack|bag|bags|tote|wallet)\b/i, categorySlugs: ['bags-wallets', 'bags'] },
+  { type: 'shoes', re: /\b(shoe|shoes|sneaker|sneakers|footwear|boots)\b/i, categorySlugs: ['footwear'] },
+  { type: 'furniture', re: /\b(chair|desk|table|sofa)\b/i, categorySlugs: ['furniture'] },
+  { type: 'fitness', re: /\b(dumbbell|weights|gym|treadmill|yoga)\b/i, categorySlugs: ['gym-equipment', 'yoga-meditation', 'sports-fitness'] },
+  { type: 'skincare', re: /\b(face wash|cleanser|serum|cream|moisturizer|skincare)\b/i, categorySlugs: ['skincare', 'face-wash-cleansers', 'beauty-personal-care'] }
+]
+
+function dedupeProducts<T extends { name: string }>(products: T[]): T[] {
+  const seen = new Set<string>()
+  const out: T[] = []
+  for (const p of products) {
+    const key = p.name.toLowerCase().trim()
+    if (!seen.has(key)) {
+      seen.add(key)
+      out.push(p)
+    }
+  }
+  return out
+}
+
+async function searchProductsCatalog({
+  query,
+  category,
+  maxPrice,
+  minPrice,
+  minRating,
+  sort,
+  limit = 5,
+}: {
+  query?: string
+  category?: string
+  maxPrice?: number
+  minPrice?: number
+  minRating?: number
+  sort?: string
+  limit?: number
+}) {
+  const where: any = { isActive: true }
+  if (maxPrice) where.price = { ...(where.price || {}), lte: maxPrice }
+  if (minPrice) where.price = { ...(where.price || {}), gte: minPrice }
+  if (minRating) where.rating = { gte: minRating }
+  if (category) {
+    where.AND = [{ OR: [{ category: { slug: category } }, { category: { parent: { slug: category } } }] }]
+  }
+
+  const candidates = await db.product.findMany({
+    where,
+    include: {
+      brand: { select: { name: true } },
+      category: { select: { name: true, slug: true } },
+    },
+  })
+
+  if (!query || !query.trim()) {
+    let sorted = [...candidates]
+    if (sort === 'price-asc') sorted.sort((a, b) => a.price - b.price)
+    else if (sort === 'price-desc') sorted.sort((a, b) => b.price - a.price)
+    else sorted.sort((a, b) => (b.rating || 0) - (a.rating || 0))
+    return dedupeProducts(sorted).slice(0, Math.min(limit, 8))
+  }
+
+  const cleanTokens = query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length > 1 && !STOP_WORDS.has(t))
+
+  if (cleanTokens.length === 0) {
+    let sorted = [...candidates]
+    if (sort === 'price-asc') sorted.sort((a, b) => a.price - b.price)
+    else if (sort === 'price-desc') sorted.sort((a, b) => b.price - a.price)
+    else sorted.sort((a, b) => (b.rating || 0) - (a.rating || 0))
+    return dedupeProducts(sorted).slice(0, Math.min(limit, 8))
+  }
+
+  const isUserAskingForAccessory = cleanTokens.some((t) => ACCESSORY_WORDS.has(t))
+  const isUserAskingForStationery = cleanTokens.some((t) => STATIONERY_WORDS.has(t))
+  const isUserAskingForLaptop = /\b(laptop|ultrabook|macbook|notebook)\b/i.test(query)
+
+  let matchedType: typeof PRODUCT_TYPE_MAPPINGS[number] | null = null
+  for (const pt of PRODUCT_TYPE_MAPPINGS) {
+    if (pt.re.test(query)) {
+      matchedType = pt
+      break
+    }
+  }
+
+  const scored = candidates.map((p) => {
+    let score = 0
+    const name = p.name.toLowerCase()
+    const catSlug = (p.category?.slug || '').toLowerCase()
+    const catName = (p.category?.name || '').toLowerCase()
+    const tags = (p.tags || '').toLowerCase()
+    const shortDesc = (p.shortDescription || '').toLowerCase()
+    const desc = (p.description || '').toLowerCase()
+    const brand = (p.brand?.name || '').toLowerCase()
+
+    // 1. Accessory filter
+    const isProductAccessory =
+      /\b(bag|sleeve|case|cover|stand|charger|cable|backpack|holder|strap|mount)\b/i.test(name) ||
+      catSlug.includes('bag') ||
+      catSlug.includes('charger') ||
+      catSlug.includes('power-bank')
+
+    if (!isUserAskingForAccessory && isProductAccessory) {
+      return { product: p, score: -1000, rawScore: -1000 }
+    }
+
+    // 2. Stationery filter (prevent paper notebook appearing for laptop)
+    const isProductStationery =
+      catSlug.includes('books-stationery') ||
+      catSlug.includes('notebooks-diaries') ||
+      catSlug.includes('pens-office-supplies')
+
+    if (!isUserAskingForStationery && isProductStationery) {
+      return { product: p, score: -1000, rawScore: -1000 }
+    }
+
+    // 3. Laptop vs Tablet distinction
+    const isProductTablet = /\b(tablet|tab|ipad)\b/i.test(name) || /\btablet\b/i.test(tags)
+    if (isUserAskingForLaptop && isProductTablet) {
+      return { product: p, score: -500, rawScore: -500 }
+    }
+
+    // 4. Type alignment
+    if (matchedType) {
+      const isTargetCat = matchedType.categorySlugs.some((s) => catSlug.includes(s))
+      const isTargetName = matchedType.re.test(name)
+      const isTargetTag = matchedType.re.test(tags)
+
+      if (isTargetName) {
+        score += 150
+      } else if (isTargetCat && isTargetTag) {
+        score += 100
+      } else if (isTargetCat) {
+        score += 60
+      } else {
+        score -= 150
+      }
+    }
+
+    // Exact phrase match
+    const qLower = query.toLowerCase().trim()
+    if (name.includes(qLower)) score += 120
+    if (tags.includes(qLower)) score += 80
+
+    // Token matches
+    let tokenMatches = 0
+    for (const t of cleanTokens) {
+      let matched = false
+      if (name.includes(t)) { score += 60; matched = true }
+      if (tags.includes(t)) { score += 35; matched = true }
+      if (catSlug.includes(t) || catName.includes(t)) { score += 30; matched = true }
+      if (brand.includes(t)) { score += 25; matched = true }
+      if (shortDesc.includes(t)) { score += 15; matched = true }
+      if (desc.includes(t)) { score += 3; matched = true }
+      if (matched) tokenMatches++
+    }
+
+    if (cleanTokens.length > 1 && tokenMatches === cleanTokens.length) {
+      score += 50
+    }
+
+    const finalScore = score > 0 ? score * 10 + (p.rating || 0) * 2 : -1
+    return { product: p, score: finalScore, rawScore: score }
+  })
+
+  const valid = scored.filter((s) => s.rawScore > 0)
+  valid.sort((a, b) => {
+    if (sort === 'price-asc') return a.product.price - b.product.price
+    if (sort === 'price-desc') return b.product.price - a.product.price
+    if (sort === 'rating') return (b.product.rating || 0) - (a.product.rating || 0)
+    return b.score - a.score
+  })
+
+  return dedupeProducts(valid.map((v) => v.product)).slice(0, Math.min(limit, 8))
+}
+
 async function executeTool(name: string, args: any, userId: string | null): Promise<ToolResult> {
   switch (name) {
     case 'search_products': {
-      const where: any = { isActive: true }
-      if (args.query) {
-        // Split into words and match any — more forgiving than a single substring
-        const words = String(args.query).split(/\s+/).filter((w) => w.length > 2)
-        if (words.length) {
-          const wordConditions: any[] = []
-          for (const w of words) {
-            wordConditions.push({ name: { contains: w } }, { description: { contains: w } }, { tags: { contains: w } }, { shortDescription: { contains: w } }, { brand: { name: { contains: w } } })
-          }
-          where.OR = wordConditions
-        }
-      }
-      if (args.category) {
-        where.AND = [{ OR: [{ category: { slug: args.category } }, { category: { parent: { slug: args.category } } }] }]
-      }
-      if (args.maxPrice) where.price = { ...where.price, lte: args.maxPrice }
-      if (args.minPrice) where.price = { ...where.price, gte: args.minPrice }
-      if (args.minRating) where.rating = { gte: args.minRating }
-      let orderBy: any = [{ rating: 'desc' }, { ratingCount: 'desc' }]
-      if (args.sort === 'price-asc') orderBy = { price: 'asc' }
-      else if (args.sort === 'price-desc') orderBy = { price: 'desc' }
-      else if (args.sort === 'rating') orderBy = { rating: 'desc' }
-      const limit = Math.min(args.limit || 5, 8)
-      const products = await db.product.findMany({
-        where,
-        orderBy,
-        take: limit,
-        include: { brand: { select: { name: true } }, category: { select: { name: true, slug: true } } },
+      const products = await searchProductsCatalog({
+        query: args.query,
+        category: args.category,
+        maxPrice: args.maxPrice,
+        minPrice: args.minPrice,
+        minRating: args.minRating,
+        sort: args.sort,
+        limit: args.limit || 5,
       })
-      return { type: 'product_list', data: { query: args.query || args.category || '*', count: products.length, products: products.map(serializeProduct) } }
+      return {
+        type: 'product_list',
+        data: {
+          query: args.query || args.category || '*',
+          maxPrice: args.maxPrice,
+          minPrice: args.minPrice,
+          count: products.length,
+          products: products.map(serializeProduct),
+        },
+      }
     }
     case 'get_product': {
       const p = await db.product.findUnique({ where: { id: args.productId }, include: { brand: { select: { name: true } }, category: { select: { name: true, slug: true } } } })
@@ -239,10 +429,25 @@ async function executeTool(name: string, args: any, userId: string | null): Prom
       return { type: 'product_detail', data: { ...serializeProduct(p), description: p.description, attributes: p.attributes ? JSON.parse(p.attributes) : {}, tags: p.tags } }
     }
     case 'compare_products': {
-      const ids: string[] = args.productIds || []
-      const products = await db.product.findMany({ where: { id: { in: ids } }, include: { brand: { select: { name: true } }, category: { select: { name: true, slug: true } } } })
-      const ordered = ids.map((id) => products.find((p) => p.id === id)).filter((p): p is typeof products[number] => Boolean(p))
-      return { type: 'comparison', data: { products: ordered.map((p) => ({ ...serializeProduct(p)!, specs: p.attributes ? JSON.parse(p.attributes) : {} })) } }
+      let ids: string[] = args.productIds || []
+      let products = await db.product.findMany({ where: { id: { in: ids } }, include: { brand: { select: { name: true } }, category: { select: { name: true, slug: true } } } })
+      if (products.length < 2 && products.length > 0) {
+        const first = products[0]
+        const peer = await db.product.findFirst({
+          where: { categoryId: first.categoryId, id: { not: first.id }, isActive: true },
+          orderBy: { rating: 'desc' },
+          include: { brand: { select: { name: true } }, category: { select: { name: true, slug: true } } },
+        })
+        if (peer) products.push(peer)
+      } else if (products.length === 0) {
+        products = await db.product.findMany({
+          where: { isActive: true },
+          orderBy: { rating: 'desc' },
+          take: 2,
+          include: { brand: { select: { name: true } }, category: { select: { name: true, slug: true } } },
+        })
+      }
+      return { type: 'comparison', data: { products: products.map((p) => ({ ...serializeProduct(p)!, specs: p.attributes ? JSON.parse(p.attributes) : {} })) } }
     }
     case 'get_cart': {
       if (!userId) return { type: 'error', data: { message: 'Please sign in to view your cart' } }
@@ -409,21 +614,27 @@ async function executeTool(name: string, args: any, userId: string | null): Prom
 }
 
 // ----------------------------------------------------------------------------
-// Multi-provider LLM client (Groq / OpenAI compatible)
+// Multi-provider LLM client (Groq / OpenAI / Gemini compatible)
 // ----------------------------------------------------------------------------
 const DEFAULT_MODEL = process.env.GROQ_MODEL || process.env.OPENAI_MODEL || 'llama-3.3-70b-versatile'
 
 async function callLLMJson(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
-  const apiKey = (process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY || process.env.AI_API_KEY || '').trim()
+  const apiKey = (process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY || process.env.AI_API_KEY || process.env.GEMINI_API_KEY || '').trim()
   if (!apiKey) throw new Error('No AI API key configured')
 
-  const isOpenAI = apiKey.startsWith('sk-') && !apiKey.startsWith('gsk_')
-  const endpoint = isOpenAI
-    ? 'https://api.openai.com/v1/chat/completions'
-    : 'https://api.groq.com/openai/v1/chat/completions'
-  const model = isOpenAI
-    ? (process.env.OPENAI_MODEL || 'gpt-4o-mini')
-    : (process.env.GROQ_MODEL || DEFAULT_MODEL)
+  const isGemini = Boolean(process.env.GEMINI_API_KEY) || apiKey.startsWith('AIza')
+  const isOpenAI = !isGemini && apiKey.startsWith('sk-') && !apiKey.startsWith('gsk_')
+
+  let endpoint = 'https://api.groq.com/openai/v1/chat/completions'
+  let model = process.env.GROQ_MODEL || DEFAULT_MODEL
+
+  if (isGemini) {
+    endpoint = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
+    model = process.env.GEMINI_MODEL || 'gemini-1.5-flash'
+  } else if (isOpenAI) {
+    endpoint = 'https://api.openai.com/v1/chat/completions'
+    model = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+  }
 
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), 12000)
@@ -460,67 +671,253 @@ async function callLLMJson(messages: Array<{ role: 'system' | 'user' | 'assistan
 // ----------------------------------------------------------------------------
 function parseNumericPrice(text: string): number | null {
   const lower = text.toLowerCase()
-  const lakhMatch = lower.match(/(\d+(?:\.\d+)?)\s*(?:lakh|lac|l)\b/)
+  const lakhMatch = lower.match(/(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)\s*(?:lakh|lac|l)\b/)
   if (lakhMatch) return parseFloat(lakhMatch[1]) * 100000
-  const kMatch = lower.match(/(\d+(?:\.\d+)?)\s*k\b/)
+  const kMatch = lower.match(/(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)\s*k\b/)
   if (kMatch) return parseFloat(kMatch[1]) * 1000
-  const numMatch = lower.match(/(?:₹|rs\.?|inr)?\s*(\d{1,3}(?:,\d{3})+|\d{3,7})\b/)
-  if (numMatch) return parseFloat(numMatch[1].replace(/,/g, ''))
+  const currencyMatch = lower.match(/(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)/)
+  if (currencyMatch) {
+    const val = parseFloat(currencyMatch[1].replace(/,/g, ''))
+    if (!isNaN(val) && val > 0) return val
+  }
+  const underMatch = lower.match(/(?:under|below|less than|within|around|upto|up to|budget(?: of)?|max)\s*(?:₹|rs\.?|inr)?\s*([\d,]+(?:\.\d+)?)/)
+  if (underMatch) {
+    const val = parseFloat(underMatch[1].replace(/,/g, ''))
+    if (!isNaN(val) && val > 0) return val
+  }
+  const commaMatch = lower.match(/\b(\d{1,3}(?:,\d{3})+)\b/)
+  if (commaMatch) {
+    const val = parseFloat(commaMatch[1].replace(/,/g, ''))
+    if (!isNaN(val) && val > 0) return val
+  }
+  const numMatch = lower.match(/\b(\d{4,7})\b/)
+  if (numMatch) {
+    const val = parseFloat(numMatch[1])
+    if (!isNaN(val) && val > 0) return val
+  }
   return null
 }
 
-function extractSemanticTools(msg: string): Array<{ name: string; args: any }> {
+function cleanQueryForSearch(text: string): string {
+  let q = text.toLowerCase()
+  q = q.replace(/(?:under|below|less than|within|around|upto|up to|budget(?: of)?|max|maximum)\s*(?:₹|rs\.?|inr)?\s*[\d,]+(?:\.\d+)?\s*(?:lakh|lac|l|k)?\b/gi, ' ')
+  q = q.replace(/(?:₹|rs\.?|inr)\s*[\d,]+(?:\.\d+)?\s*(?:lakh|lac|l|k)?\b/gi, ' ')
+  q = q.replace(/\b\d+(?:\.\d+)?\s*(?:lakh|lac|l|k)\b/gi, ' ')
+  q = q.replace(/\b\d{1,3}(?:,\d{3})+\b/gi, ' ')
+  q = q.replace(/\b\d{4,7}\b/gi, ' ')
+  q = q.replace(/\b(?:i need|i want|show me|find|looking for|recommend|suggest|give me|can you|please|search for|help me find|what are|tell me about)\b/gi, ' ')
+  q = q.replace(/[,;?!()"'`]/g, ' ')
+  q = q.replace(/\b(?:a|an|the|for|and|or|with|in|of|to|at|by|from|right now|currently|available|best|top|options|items|products|good)\b/gi, ' ')
+  return q.replace(/\s+/g, ' ').trim()
+}
+
+async function extractSemanticTools(msg: string, history: AIMessage[] = []): Promise<Array<{ name: string; args: any }>> {
   const lower = msg.toLowerCase().trim()
 
-  // Greeting
+  // 1. Greeting
   if (/^(hi|hello|hey|greetings|hola|good morning|good evening|howdy)\b/i.test(lower) && lower.length < 25) {
     return []
   }
 
-  // Affordability intent
-  if (lower.includes('afford') || lower.includes('can i buy') || lower.includes('can i get') || lower.includes('budget') || lower.includes('salary')) {
-    const price = parseNumericPrice(lower) || 5000
-    return [{ name: 'check_affordability', args: { price } }]
+  // 2. Savings Goal intent ("help me set a savings goal for a new workstation", "set a goal to save 50000")
+  if (lower.includes('goal') || lower.includes('save for') || lower.includes('savings target')) {
+    const price = parseNumericPrice(lower)
+    let title = 'Savings Goal'
+    let targetAmount = price || 50000
+
+    if (lower.includes('workstation')) {
+      title = 'Forge Workstation 15'
+      const p = await db.product.findFirst({ where: { name: { contains: 'Workstation' } }, select: { price: true } })
+      if (p) targetAmount = price || p.price
+    } else if (lower.includes('laptop')) {
+      title = 'New Laptop'
+      targetAmount = price || 70000
+    } else if (lower.includes('phone')) {
+      title = 'New Smartphone'
+      targetAmount = price || 40000
+    } else {
+      const clean = lower.replace(/\b(?:help me|set|a|savings|goal|for|save|up|to|target|please)\b/gi, ' ').trim()
+      if (clean) title = clean.charAt(0).toUpperCase() + clean.slice(1)
+    }
+
+    return [{ name: 'create_goal', args: { title, targetAmount } }]
   }
 
-  // Cart optimization
+  // 3. Price alert / Price Watch intent
+  if (lower.includes('price alert') || lower.includes('price drop') || lower.includes('track price') || lower.includes('watch price')) {
+    const price = parseNumericPrice(lower)
+    const clean = cleanQueryForSearch(lower.replace(/price alert|price drop|track price|watch price/g, ' '))
+    if (clean) {
+      const p = await db.product.findFirst({
+        where: { OR: [{ name: { contains: clean } }, { tags: { contains: clean } }] },
+        select: { id: true, price: true }
+      })
+      if (p) {
+        return [{ name: 'create_price_watch', args: { productId: p.id, targetPrice: price || Math.round(p.price * 0.9) } }]
+      }
+    }
+    return [{ name: 'search_products', args: { query: clean || 'deals', limit: 3 } }]
+  }
+
+  // 4. Add to cart intent
+  if (/\b(?:add to cart|buy now|add .* to cart)\b/i.test(lower)) {
+    const clean = lower.replace(/\b(?:add to cart|add|to cart|buy now|buy|please)\b/gi, ' ').trim()
+    if (clean) {
+      const p = await db.product.findFirst({
+        where: { OR: [{ name: { contains: clean } }, { tags: { contains: clean } }] },
+        select: { id: true }
+      })
+      if (p) {
+        return [{ name: 'add_to_cart', args: { productId: p.id, quantity: 1 } }]
+      }
+    }
+  }
+
+  // 5. Affordability intent
+  if (lower.includes('afford') || lower.includes('can i buy') || lower.includes('can i get') || lower.includes('salary') || lower.includes('budget impact')) {
+    let price = parseNumericPrice(lower)
+    if (!price) {
+      // Try to find mentioned product price
+      const clean = cleanQueryForSearch(lower)
+      if (clean) {
+        const p = await db.product.findFirst({
+          where: { OR: [{ name: { contains: clean } }, { tags: { contains: clean } }] },
+          select: { price: true }
+        })
+        if (p) price = p.price
+      }
+    }
+    return [{ name: 'check_affordability', args: { price: price || 6000 } }]
+  }
+
+  // 6. Cart optimization
   if (lower.includes('optimise') || lower.includes('optimize') || lower.includes('my cart') || (lower.includes('cart') && lower.includes('save'))) {
     return [{ name: 'get_cart', args: {} }, { name: 'optimize_cart', args: {} }]
   }
 
-  // Price alert
-  if (lower.includes('price alert') || lower.includes('price drop') || lower.includes('track price') || lower.includes('watch price')) {
-    const clean = lower.replace(/price alert|price drop|track price|watch price/g, '').trim()
-    return [{ name: 'search_products', args: { query: clean || 'deals', limit: 3 } }]
-  }
+  // 7. Comparison intent
+  if (lower.includes('compare') || lower.includes('difference between') || lower.includes(' vs ')) {
+    // Check if user says "compare top 2" or "compare top"
+    if (/compare\s+(?:the\s+)?top\s*(?:2|options|two)?/i.test(lower)) {
+      // Look back at previous user message to find what category was being searched
+      const prevUserMsg = [...history].reverse().find((m) => m.role === 'user' && m.content !== msg)?.content || ''
+      const searchTerms = cleanQueryForSearch(prevUserMsg || 'laptop')
+      const products = await searchProductsCatalog({ query: searchTerms, limit: 2 })
+      if (products.length >= 2) {
+        return [{ name: 'compare_products', args: { productIds: [products[0].id, products[1].id] } }]
+      }
+    }
 
-  // Comparison
-  if (lower.includes('compare')) {
-    const clean = lower.replace(/compare|vs|between|the/g, ' ').trim()
+    // Direct comparison (e.g. "compare the top headphones for travel")
+    const clean = cleanQueryForSearch(lower.replace(/compare|difference between|vs|between/gi, ' '))
+    const products = await searchProductsCatalog({ query: clean || 'headphones', limit: 2 })
+    if (products.length >= 2) {
+      return [{ name: 'compare_products', args: { productIds: [products[0].id, products[1].id] } }]
+    }
     return [{ name: 'search_products', args: { query: clean || 'laptop', limit: 2 } }]
   }
 
-  // Product search
+  // 8. Product search
   const price = parseNumericPrice(lower)
-  const cleanQuery = lower
-    .replace(/(?:under|below|less than|within|around|upto|up to)\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?\s*(?:lakh|lac|l|k)?|\d[\d,]*)?/gi, ' ')
-    .replace(/\b(?:i need|i want|show me|find|looking for|recommend|suggest|give me|a|an|the|best|top|for|right now|please)\b/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
+  const cleanQuery = cleanQueryForSearch(lower)
 
   if (cleanQuery.length >= 2 || price !== null) {
+    let sort: string | undefined = undefined
+    if (lower.includes('cheapest') || lower.includes('lowest price') || lower.includes('budget friendly')) {
+      sort = 'price-asc'
+    } else if (lower.includes('premium') || lower.includes('expensive')) {
+      sort = 'price-desc'
+    } else if (lower.includes('best') || lower.includes('top rated') || lower.includes('highest rated')) {
+      sort = 'rating'
+    }
+
     return [{
       name: 'search_products',
       args: {
         query: cleanQuery || undefined,
         maxPrice: price || undefined,
         minRating: (lower.includes('best') || lower.includes('top rated')) ? 4.0 : undefined,
+        sort,
         limit: 5,
       }
     }]
   }
 
   return []
+}
+
+function formatProductSearchHeading(userMessage: string, data: any): string {
+  const lower = userMessage.toLowerCase()
+
+  let label = 'product'
+  if (/\b(laptop|ultrabook|macbook|notebook)\b/i.test(lower)) label = 'laptop'
+  else if (/\b(tablet|ipad)\b/i.test(lower)) label = 'tablet'
+  else if (/\b(headphone|headphones|earphone|earphones|earbud|earbuds|airpods|headset)\b/i.test(lower)) label = 'headphone'
+  else if (/\b(phone|smartphone|smartphones|mobile|iphone)\b/i.test(lower)) label = 'smartphone'
+  else if (/\b(smartwatch|smartwatches|watch|watches)\b/i.test(lower)) label = 'smartwatch'
+  else if (/\b(tv|television|televisions)\b/i.test(lower)) label = 'television'
+  else if (/\b(backpack|bag|bags|tote|wallet)\b/i.test(lower)) label = 'backpack'
+  else if (/\b(shoe|shoes|sneaker|sneakers|footwear|boots)\b/i.test(lower)) label = 'footwear'
+  else if (/\b(chair|desk|table|sofa)\b/i.test(lower)) label = 'furniture'
+  else if (/\b(dumbbell|weights|gym)\b/i.test(lower)) label = 'fitness'
+  else if (/\b(face wash|cleanser)\b/i.test(lower)) label = 'face wash'
+  else if (/\b(skincare|moisturizer|cream|serum)\b/i.test(lower)) label = 'skincare'
+  else if (data.query && data.query !== '*') {
+    const cleanQ = String(data.query).replace(/[^a-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()
+    if (cleanQ) label = cleanQ
+  }
+
+  const useCases: string[] = []
+  if (lower.includes('programming') || lower.includes('coding')) useCases.push('programming')
+  if (lower.includes('gaming')) useCases.push('gaming')
+  if (lower.includes('travel')) useCases.push('travel')
+  if (lower.includes('student') || lower.includes('college')) useCases.push('students')
+  if (lower.includes('work') || lower.includes('office')) useCases.push('work')
+  if (lower.includes('running') || lower.includes('workout') || lower.includes('gym')) useCases.push('fitness')
+
+  let priceStr = ''
+  if (data.maxPrice) {
+    priceStr = ` under ₹${Number(data.maxPrice).toLocaleString('en-IN')}`
+  } else if (data.minPrice) {
+    priceStr = ` above ₹${Number(data.minPrice).toLocaleString('en-IN')}`
+  }
+
+  let useCaseStr = ''
+  if (useCases.length > 0) {
+    useCaseStr = ` for ${useCases.join(' and ')}`
+  }
+
+  if (data.products.length === 0) {
+    return `I searched our catalog for ${label} options${priceStr}${useCaseStr}, but couldn't find an exact match in stock. Try broadening your criteria or browsing our categories!`
+  }
+
+  return `Here are the top ${label} options${priceStr}${useCaseStr} I found for you in our catalog:`
+}
+
+function generateProductSuggestions(userMessage: string, data: any): string[] {
+  const lower = userMessage.toLowerCase()
+  const suggestions: string[] = []
+
+  if (data.products.length >= 2) {
+    suggestions.push('Compare top 2')
+  }
+
+  if (/\blaptop\b/i.test(lower)) {
+    if (data.maxPrice && data.maxPrice <= 70000) {
+      suggestions.push('Stretch budget to ₹75,000')
+    } else {
+      suggestions.push('Show under ₹60,000')
+    }
+    suggestions.push('Check affordability')
+  } else if (/\bheadphone\b/i.test(lower)) {
+    suggestions.push('Compare the top headphones for travel')
+    suggestions.push('Can I afford a ₹6,000 headphone right now?')
+  } else {
+    suggestions.push('Check customer reviews')
+    suggestions.push('Check affordability')
+  }
+
+  return suggestions.slice(0, 3)
 }
 
 function generateFallbackResponse(userMessage: string, toolResults: ToolResult[]): { message: string; suggestions: string[] } {
@@ -549,53 +946,88 @@ function generateFallbackResponse(userMessage: string, toolResults: ToolResult[]
     }
   }
 
-  // 2. Product list
-  const prodResult = toolResults.find((t) => t.type === 'product_list')
-  if (prodResult) {
-    const { data } = prodResult
-    const qName = data.query === '*' || !data.query ? 'products' : data.query
-    if (data.products.length === 0) {
-      return {
-        message: `I searched our catalog for "${qName}", but couldn't find an exact match in that price range. Try broadening your criteria or browsing our categories!`,
-        suggestions: ['Browse all products', 'Browse Electronics', 'Browse Books & Stationery']
-      }
-    }
+  // 2. Goal Proposal
+  const goalResult = toolResults.find((t) => t.type === 'goal_proposal')
+  if (goalResult) {
+    const { data } = goalResult
     return {
-      message: `Here are the top ${qName} options I found for you in our catalog:`,
-      suggestions: ['Compare top 2', 'Show under ₹50,000', 'Check customer reviews']
+      message: `I've prepared a savings goal proposal for "${data.title}" targeting ${formatPrice(data.targetAmount)}. Setting gradual savings targets is a great way to buy high-value items responsibly. Click "Create" below to start tracking your goal!`,
+      suggestions: ['View active goals', 'Adjust target amount', 'Check affordability'],
     }
   }
 
-  // 3. Comparison
+  // 3. Price Watch Proposal
+  const pwResult = toolResults.find((t) => t.type === 'price_watch_proposal')
+  if (pwResult) {
+    const { data } = pwResult
+    return {
+      message: `I've prepared a price alert for ${data.productName} at ${formatPrice(data.targetPrice)} (current price: ${formatPrice(data.currentPrice)}). We'll notify you as soon as the price drops to or below your target!`,
+      suggestions: ['Set alert', 'Check alternatives', 'Add to wishlist'],
+    }
+  }
+
+  // 4. Add to Cart Proposal
+  const cartPropResult = toolResults.find((t) => t.type === 'add_to_cart_proposal')
+  if (cartPropResult) {
+    const { data } = cartPropResult
+    return {
+      message: `I've prepared ${data.productName} (${formatPrice(data.price)}) for your cart. Confirm below to add it:`,
+      suggestions: ['View cart', 'Optimise cart for savings', 'Continue shopping'],
+    }
+  }
+
+  // 5. Comparison
   const compResult = toolResults.find((t) => t.type === 'comparison')
   if (compResult) {
+    const names = (compResult.data.products || []).map((p: any) => p.name).join(' vs ')
     return {
-      message: `Here is a side-by-side comparison of the options:`,
-      suggestions: ['Add best rated to cart', 'Check affordability', 'Ask for recommendation']
+      message: names ? `Here is a side-by-side comparison of ${names}:` : `Here is a side-by-side comparison of the options:`,
+      suggestions: ['Add best rated to cart', 'Check affordability', 'Ask for recommendation'],
     }
   }
 
-  // 4. Cart optimization
+  // 6. Cart Optimization
   const cartOptResult = toolResults.find((t) => t.type === 'cart_optimization')
   if (cartOptResult) {
     return {
       message: `I analyzed your cart items. Here are smart ways to optimize your purchase:`,
-      suggestions: ['Apply coupon SAVE10', 'Proceed to checkout', 'Keep shopping']
+      suggestions: ['Apply coupon SAVE10', 'Proceed to checkout', 'Keep shopping'],
     }
   }
 
-  // 5. Greetings
+  // 7. Group Room Analysis
+  const roomResult = toolResults.find((t) => t.type === 'group_room_analysis')
+  if (roomResult) {
+    return {
+      message: `Here is the group decision analysis for "${roomResult.data.roomName}". Review the member votes, budget status, and identified priorities below:`,
+      suggestions: ['View room details', 'Add top voted to cart', 'Check split total'],
+    }
+  }
+
+  // 8. Product list
+  const prodResult = toolResults.find((t) => t.type === 'product_list')
+  if (prodResult) {
+    const { data } = prodResult
+    const heading = formatProductSearchHeading(userMessage, data)
+    const suggestions = generateProductSuggestions(userMessage, data)
+    return {
+      message: heading,
+      suggestions,
+    }
+  }
+
+  // 9. Greetings
   if (/^(hi|hello|hey|greetings|hola|good morning|good evening|howdy)\b/i.test(lower)) {
     return {
       message: `Hi there! I'm your Buywise AI shopping partner. I can help you search our catalog (e.g. "under 1 lakh laptop"), check affordability against your budget ("Can I afford a ₹6,000 headphone?"), compare items, or optimize your cart. What are you shopping for today?`,
-      suggestions: ['Laptops under ₹70,000', 'Top headphones for travel', 'Can I afford a ₹6,000 purchase?', 'Optimise my cart']
+      suggestions: ['Laptops under ₹70,000', 'Compare the top headphones for travel', 'Can I afford a ₹6,000 headphone right now?', 'Optimise my cart for savings'],
     }
   }
 
-  // 6. Generic intelligent response
+  // 10. Generic intelligent response
   return {
-    message: `I'm here to help you shop smarter! You can ask me to search products ('under 1 lakh laptop'), check affordability ('Can I afford ₹6,000?'), compare items ('compare laptops'), or optimize your cart.`,
-    suggestions: ['Laptops under ₹70,000', 'Top deals today', 'Can I afford a ₹6,000 purchase?']
+    message: `I'm here to help you shop smarter! You can ask me to search products ('laptop under ₹70,000'), check affordability ('Can I afford ₹6,000?'), compare items ('compare laptops'), or optimize your cart.`,
+    suggestions: ['Laptops under ₹70,000', 'Compare the top headphones for travel', 'Can I afford a ₹6,000 headphone right now?', 'Optimise my cart for savings'],
   }
 }
 
@@ -627,7 +1059,7 @@ ${JSON.stringify(context, null, 2)}`
 
   // If LLM returned no tools or wasn't configured, use semantic intent extraction
   if (toolCalls.length === 0) {
-    toolCalls = extractSemanticTools(userMessage)
+    toolCalls = await extractSemanticTools(userMessage, history)
   }
 
   // STEP 2 — execute tools

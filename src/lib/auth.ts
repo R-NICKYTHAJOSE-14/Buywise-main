@@ -25,7 +25,19 @@ export function verifyPassword(password: string, stored: string): boolean {
 }
 
 // Simple signed session token (no external JWT lib needed)
-const SECRET = process.env.AUTH_SECRET || 'ai-shop-secret-change-me-' + (process.env.NODE_ENV || 'dev')
+// AUTH_SECRET is mandatory in production: a guessable default would let anyone forge session tokens.
+const SECRET = (() => {
+  const s = process.env.AUTH_SECRET
+  if (s && s.length >= 16) return s
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('AUTH_SECRET must be set (min 16 chars) in production')
+  }
+  return 'ai-shop-secret-change-me-' + (process.env.NODE_ENV || 'dev')
+})()
+
+export function getAuthSecret(): string {
+  return SECRET
+}
 
 export function createSessionToken(userId: string): string {
   const payload = { userId, exp: Date.now() + 1000 * 60 * 60 * 24 * 7 } // 7 days

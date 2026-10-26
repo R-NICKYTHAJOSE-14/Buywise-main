@@ -4,8 +4,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Sparkles, Loader2, Check } from 'lucide-react'
-import { useState } from 'react'
+import { InputOTP, InputOTPGroup, InputOTPSlot } from '@/components/ui/input-otp'
+import { Sparkles, Loader2, Mail, ArrowLeft } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { useStore } from '@/lib/store'
 import { api, refreshCartCount } from '@/lib/api'
 import { toast } from 'sonner'
@@ -37,42 +38,64 @@ export function AuthModal() {
   const { authOpen, authMode, setAuthOpen, setUser } = useStore()
   const [loading, setLoading] = useState(false)
   const [googleLoading, setGoogleLoading] = useState(false)
-  const [googleSelectorOpen, setGoogleSelectorOpen] = useState(false)
-  const [customGoogleEmail, setCustomGoogleEmail] = useState('')
-  const [customGoogleName, setCustomGoogleName] = useState('')
+  const [otpStep, setOtpStep] = useState<null | 'email' | 'code'>(null)
+  const [otpEmail, setOtpEmail] = useState('')
+  const [otpCode, setOtpCode] = useState('')
+  const [cooldown, setCooldown] = useState(0)
+
+  useEffect(() => {
+    if (cooldown <= 0) return
+    const t = setTimeout(() => setCooldown((c) => c - 1), 1000)
+    return () => clearTimeout(t)
+  }, [cooldown])
+
+  function resetOtp() {
+    setOtpStep(null)
+    setOtpCode('')
+    setCooldown(0)
+  }
   const [form, setForm] = useState({ firstName: '', lastName: '', email: '', phone: '', password: '' })
 
   function switchMode(mode: 'login' | 'register') {
     useStore.getState().setAuthOpen(true, mode)
     setForm({ firstName: '', lastName: '', email: '', phone: '', password: '' })
-    setGoogleSelectorOpen(false)
+    resetOtp()
   }
 
-  async function handleGoogleLogin(email?: string, name?: string) {
+  function handleGoogleLogin() {
     setGoogleLoading(true)
+    api.auth.google() // full-page redirect to Google's real account chooser
+  }
+
+  async function sendOtp() {
+    setLoading(true)
     try {
-      const chosenEmail = email || 'alex.morgan@gmail.com'
-      const fullName = (name || 'Alex Morgan').trim()
-      const parts = fullName.split(' ')
-      const firstName = parts[0] || 'Google'
-      const lastName = parts.slice(1).join(' ') || 'User'
+      await api.auth.otpRequest(otpEmail)
+      setOtpStep('code')
+      setOtpCode('')
+      setCooldown(60)
+      toast.success('We sent a 6-digit code to your email.')
+    } catch (e: any) {
+      toast.error(e.message || 'Could not send code')
+    } finally {
+      setLoading(false)
+    }
+  }
 
-      const res = await api.auth.google({
-        email: chosenEmail,
-        firstName,
-        lastName,
-      })
-
-      const user = res.user
-      setUser(user)
+  async function verifyOtp(code: string) {
+    setLoading(true)
+    try {
+      const res = await api.auth.otpVerify(otpEmail, code)
+      setUser(res.user)
       setAuthOpen(false)
-      setGoogleSelectorOpen(false)
-      toast.success(`Welcome to Buywise, ${user.firstName}! Signed in with Google.`)
+      resetOtp()
+      toast.success(`Welcome, ${res.user.firstName}!`)
       refreshCartCount().catch(() => {})
     } catch (e: any) {
-      toast.error(e.message || 'Google Sign-In failed')
+      setOtpCode('')
+      toast.error(e.message || 'Verification failed')
     } finally {
-      setGoogleLoading(false)
+      setLoading(false)
     }
   }
 
@@ -106,7 +129,7 @@ export function AuthModal() {
   }
 
   return (
-    <Dialog open={authOpen} onOpenChange={(o) => { setAuthOpen(o); if (!o) setGoogleSelectorOpen(false) }}>
+    <Dialog open={authOpen} onOpenChange={(o) => { setAuthOpen(o); if (!o) resetOtp() }}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <div className="mx-auto mb-2 flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/20">
@@ -128,7 +151,7 @@ export function AuthModal() {
             type="button"
             variant="outline"
             disabled={googleLoading || loading}
-            onClick={() => setGoogleSelectorOpen((prev) => !prev)}
+            onClick={handleGoogleLogin}
             className="relative flex h-11 w-full items-center justify-center gap-2.5 rounded-xl border-border/80 bg-background font-medium shadow-xs hover:bg-muted/60 hover:text-foreground transition-all"
           >
             {googleLoading ? (
@@ -138,56 +161,6 @@ export function AuthModal() {
             )}
             <span>Continue with Google</span>
           </Button>
-
-          {/* Interactive Google Account Selector Tray */}
-          {googleSelectorOpen && (
-            <div className="rounded-xl border border-primary/20 bg-primary/5 p-3.5 text-xs animate-fade-in space-y-2.5">
-              <p className="font-semibold text-foreground flex items-center justify-between">
-                <span>Select Google Account</span>
-                <span className="text-[10px] font-normal text-muted-foreground">1-click sign-in</span>
-              </p>
-
-              {/* Pre-configured Google User */}
-              <button
-                type="button"
-                onClick={() => handleGoogleLogin('alex.morgan@gmail.com', 'Alex Morgan')}
-                className="w-full flex items-center justify-between gap-2.5 rounded-lg border border-border bg-card p-2 text-left hover:border-primary/50 hover:bg-accent transition-colors"
-              >
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-blue-600 font-bold text-white text-[11px]">
-                    A
-                  </div>
-                  <div className="min-w-0">
-                    <p className="font-medium text-foreground truncate">Alex Morgan</p>
-                    <p className="text-[11px] text-muted-foreground truncate">alex.morgan@gmail.com</p>
-                  </div>
-                </div>
-                <Check className="h-4 w-4 text-primary shrink-0 opacity-80" />
-              </button>
-
-              {/* Enter custom Google email */}
-              <div className="pt-1 space-y-1.5">
-                <p className="text-[11px] text-muted-foreground">Or sign in with your Google email:</p>
-                <div className="flex gap-1.5">
-                  <Input
-                    placeholder="name@gmail.com"
-                    value={customGoogleEmail}
-                    onChange={(e) => setCustomGoogleEmail(e.target.value)}
-                    className="h-8 text-xs bg-background"
-                  />
-                  <Button
-                    type="button"
-                    size="sm"
-                    className="h-8 px-3 text-xs"
-                    disabled={!customGoogleEmail || !customGoogleEmail.includes('@')}
-                    onClick={() => handleGoogleLogin(customGoogleEmail, customGoogleName || customGoogleEmail.split('@')[0])}
-                  >
-                    Continue
-                  </Button>
-                </div>
-              </div>
-            </div>
-          )}
 
           {/* Divider */}
           <div className="relative my-2">
@@ -200,6 +173,51 @@ export function AuthModal() {
           </div>
         </div>
 
+        {otpStep ? (
+          <div className="space-y-3">
+            <button type="button" onClick={resetOtp} className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
+              <ArrowLeft className="h-3.5 w-3.5" /> Back
+            </button>
+            {otpStep === 'email' ? (
+              <form onSubmit={(e) => { e.preventDefault(); sendOtp() }} className="space-y-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="otp-email" className="text-xs">Email</Label>
+                  <Input id="otp-email" type="email" value={otpEmail} onChange={(e) => setOtpEmail(e.target.value)} required autoFocus />
+                </div>
+                <Button type="submit" className="w-full h-10 rounded-xl" disabled={loading || !otpEmail.includes('@')}>
+                  {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                  Send code
+                </Button>
+              </form>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-center text-xs text-muted-foreground">
+                  Enter the 6-digit code sent to <span className="font-medium text-foreground">{otpEmail}</span>
+                </p>
+                <div className="flex justify-center">
+                  <InputOTP maxLength={6} value={otpCode} onChange={setOtpCode} onComplete={verifyOtp} disabled={loading} autoFocus>
+                    <InputOTPGroup>
+                      {[0, 1, 2, 3, 4, 5].map((i) => <InputOTPSlot key={i} index={i} />)}
+                    </InputOTPGroup>
+                  </InputOTP>
+                </div>
+                <Button type="button" className="w-full h-10 rounded-xl" disabled={loading || otpCode.length !== 6} onClick={() => verifyOtp(otpCode)}>
+                  {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                  Verify & sign in
+                </Button>
+                <button
+                  type="button"
+                  disabled={loading || cooldown > 0}
+                  onClick={sendOtp}
+                  className="w-full text-xs text-primary hover:underline disabled:text-muted-foreground disabled:no-underline"
+                >
+                  {cooldown > 0 ? `Resend code in ${cooldown}s` : 'Resend code'}
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+        <>
         {/* Email & Password Form */}
         <form onSubmit={submit} className="space-y-3">
           {authMode === 'register' && (
@@ -235,6 +253,17 @@ export function AuthModal() {
         </form>
 
         {authMode === 'login' && (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => { setOtpEmail(form.email); setOtpStep('email') }}
+            className="w-full h-10 rounded-xl gap-2"
+          >
+            <Mail className="h-4 w-4" /> Sign in with email code
+          </Button>
+        )}
+
+        {authMode === 'login' && (
           <button
             type="button"
             onClick={fillDemo}
@@ -242,6 +271,8 @@ export function AuthModal() {
           >
             Use demo account → <span className="font-medium text-foreground">demo@ai-shop.in</span> / demo1234
           </button>
+        )}
+        </>
         )}
 
         <p className="text-center text-xs text-muted-foreground pt-1">

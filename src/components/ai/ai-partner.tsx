@@ -216,7 +216,7 @@ function ToolResultCard({ result, onNavigate }: { result: any; onNavigate: (id: 
           </div>
           <div className="max-h-80 overflow-y-auto scrollbar-thin">
             {data.products.map((p: any) => (
-              <ProductRow key={p.id} product={p} onClick={() => onNavigate(p.id)} />
+              <ProductRow key={p.id} product={p} onClick={() => onNavigate(p.id)} showDesc />
             ))}
             {data.products.length === 0 && <p className="px-3 py-6 text-center text-sm text-muted-foreground">No products matched. Try broadening your criteria.</p>}
           </div>
